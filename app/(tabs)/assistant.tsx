@@ -17,15 +17,15 @@ import { Ionicons } from "@expo/vector-icons";
 import * as DocumentPicker from "expo-document-picker";
 
 // ─────────────────────────────────────────────────────────────
-// 🔑  PASTE YOUR ANTHROPIC API KEY HERE
+// 🔑  PASTE YOUR GEMINI API KEY HERE
 // ─────────────────────────────────────────────────────────────
-const ANTHROPIC_API_KEY = "sk-ant-REPLACE_WITH_YOUR_KEY";
+const GEMINI_API_KEY = "AIzaSyBfl52Rxms87IVAwmgIVbCFwDaePd32WnM";
 // ─────────────────────────────────────────────────────────────
 
 type AssistantTab =
   | "chat"
   | "packing"
-  | "vault"
+  // | "vault"
   | "safety"
   | "currency"
   | "weather";
@@ -82,32 +82,41 @@ const CHAT_PROMPTS = [
   "Visa requirements for Thailand?",
 ];
 
-// ── Anthropic helper ──────────────────────────────────────────
-async function callClaude(
+// ── Gemini helper ─────────────────────────────────────────────
+// Uses gemini-2.0-flash via the generateContent REST endpoint.
+// `system` becomes the first "user" turn prefixed with role context,
+// and previous messages are mapped to Gemini's "user"/"model" roles.
+async function callGemini(
   system: string,
   messages: { role: "user" | "assistant"; content: string }[],
   maxTokens = 1000,
 ): Promise<string> {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
+  // Gemini uses "user" / "model" roles (not "assistant")
+  const geminiMessages = messages.map((m) => ({
+    role: m.role === "assistant" ? "model" : "user",
+    parts: [{ text: m.content }],
+  }));
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+
+  const res = await fetch(url, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: maxTokens,
-      system,
-      messages,
+      system_instruction: { parts: [{ text: system }] },
+      contents: geminiMessages,
+      generationConfig: { maxOutputTokens: maxTokens },
     }),
   });
+
   if (!res.ok) {
     const err = await res.text();
-    throw new Error(`Claude API error ${res.status}: ${err}`);
+    throw new Error(`Gemini API error ${res.status}: ${err}`);
   }
+
   const data = await res.json();
-  return data.content?.[0]?.text ?? "";
+  // Response path: candidates[0].content.parts[0].text
+  return data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
 }
 
 export default function AssistantScreen() {
@@ -135,7 +144,7 @@ export default function AssistantScreen() {
   const [newDocType, setNewDocType] = useState("passport");
   const [newDocNote, setNewDocNote] = useState("");
   const [vaultLoading, setVaultLoading] = useState(false);
-  const [uploadingId, setUploadingId] = useState<string | null>(null); // doc id being uploaded
+  const [uploadingId, setUploadingId] = useState<string | null>(null);
 
   // Currency
   const [amount, setAmount] = useState("1000");
@@ -159,7 +168,7 @@ export default function AssistantScreen() {
     setMessages(updated);
     setChatLoading(true);
     try {
-      const reply = await callClaude(
+      const reply = await callGemini(
         "You are a helpful AI travel assistant. Give concise, practical advice (under 120 words). Focus on Indian travel context when relevant. Be friendly and specific.",
         updated.map((m) => ({
           role: m.role === "ai" ? "assistant" : "user",
@@ -189,7 +198,7 @@ export default function AssistantScreen() {
     setPackLoading(true);
     setPackList([]);
     try {
-      const text = await callClaude(
+      const text = await callGemini(
         'Return ONLY a JSON array of strings. No markdown, no preamble. Example: ["Item 1","Item 2"]',
         [
           {
@@ -244,8 +253,11 @@ export default function AssistantScreen() {
     setDocs((prev) => prev.filter((d) => d.id !== id));
   };
 
-  // Pick a file from the phone and upload to Supabase Storage
-  // Matches the pattern in fileUpload util: fetch URI → blob → File → supabase.storage.upload
+  // ── FIX: upload blob directly — do NOT use `new File([blob], name)`
+  // React Native's Blob has `name` as a read-only getter, so the File
+  // constructor throws "Cannot assign to property 'name' which has only
+  // a getter". Pass the blob straight to Supabase and set contentType
+  // via the upload options instead.
   const pickAndUploadFile = async (docId: string) => {
     try {
       const result = await DocumentPicker.getDocumentAsync({
@@ -267,22 +279,21 @@ export default function AssistantScreen() {
         return;
       }
 
-      // Fetch the local URI and convert to a Blob (same approach as web File API)
+      // Fetch the local URI and convert to a Blob
       const response = await fetch(asset.uri);
       const blob = await response.blob();
 
       const ext = asset.name.split(".").pop() ?? "bin";
-      const mimeType = asset.mimeType ?? "application/octet-stream";
+      const mimeType = asset.mimeType ?? blob.type ?? "application/octet-stream";
 
-      // Construct a File object from the blob (React Native supports this via Blob)
-      const file = new File([blob], asset.name, { type: mimeType });
-
-      // Storage path: userId/docId.ext  (mirrors your fileUpload util pattern)
+      // Storage path: userId/docId.ext
       const storagePath = `${user.id}/${docId}.${ext}`;
 
+      // ✅ Upload the blob directly — no `new File()` wrapper needed.
+      // Supabase Storage accepts a Blob just fine; pass contentType in options.
       const { error: uploadError } = await supabase.storage
         .from("travel-documents")
-        .upload(storagePath, file, {
+        .upload(storagePath, blob, {
           contentType: mimeType,
           upsert: true,
         });
@@ -293,7 +304,7 @@ export default function AssistantScreen() {
         return;
       }
 
-      // Get a signed URL valid for 1 year (bucket is private, matching your setup)
+      // Get a signed URL valid for 1 year
       const { data: signedData, error: signErr } = await supabase.storage
         .from("travel-documents")
         .createSignedUrl(storagePath, 60 * 60 * 24 * 365);
@@ -328,9 +339,9 @@ export default function AssistantScreen() {
     Linking.openURL(url).catch(() => Alert.alert("Cannot open file"));
   };
 
-  useEffect(() => {
-    if (activeTab === "vault") fetchDocs();
-  }, [activeTab]);
+  // useEffect(() => {
+  //   if (activeTab === "vault") fetchDocs();
+  // }, [activeTab]);
 
   // ── Weather ───────────────────────────────────────────────────
   const getWeather = async () => {
@@ -341,7 +352,7 @@ export default function AssistantScreen() {
     setWeatherLoading(true);
     setWeatherInfo("");
     try {
-      const text = await callClaude(
+      const text = await callGemini(
         "You are a travel weather advisor. Give a brief (60 words max) weather summary for the city including typical temperature, what to expect, and what to wear. Be practical.",
         [
           {
@@ -365,7 +376,7 @@ export default function AssistantScreen() {
   }[] = [
     { key: "chat", icon: "chatbubble-outline", label: "Chat" },
     { key: "packing", icon: "bag-outline", label: "Packing" },
-    { key: "vault", icon: "document-text-outline", label: "Vault" },
+    // { key: "vault", icon: "document-text-outline", label: "Vault" },
     { key: "safety", icon: "shield-outline", label: "Safety" },
     { key: "currency", icon: "cash-outline", label: "Currency" },
     { key: "weather", icon: "partly-sunny-outline", label: "Weather" },
@@ -569,13 +580,11 @@ export default function AssistantScreen() {
         </ScrollView>
       )}
 
-      {/* ── VAULT ── */}
-      {activeTab === "vault" && (
-        <ScrollView
+      {/* {activeTab === "vault" && ( */}
+        {/* <ScrollView
           className="flex-1 px-5 pt-5"
           showsVerticalScrollIndicator={false}
         >
-          {/* Add doc */}
           <View className="bg-white border border-[#F3F0FF] rounded-3xl p-4 gap-3 mb-4">
             <Text className="text-[#111827] text-sm font-bold">
               Add Document
@@ -636,7 +645,6 @@ export default function AssistantScreen() {
                   key={doc.id}
                   className="bg-white border border-[#F3F0FF] rounded-2xl px-4 py-3 gap-2"
                 >
-                  {/* Top row */}
                   <View className="flex-row items-center gap-3">
                     <View className="w-10 h-10 rounded-xl bg-[#EDE9FE] items-center justify-center">
                       <Ionicons
@@ -664,9 +672,7 @@ export default function AssistantScreen() {
                     </TouchableOpacity>
                   </View>
 
-                  {/* File actions row */}
                   <View className="flex-row gap-2 mt-1">
-                    {/* Upload / re-upload button */}
                     <TouchableOpacity
                       className="flex-1 flex-row items-center justify-center gap-1.5 h-9 rounded-xl border border-[#DDD6FE] bg-[#F5F3FF]"
                       onPress={() => pickAndUploadFile(doc.id)}
@@ -688,7 +694,6 @@ export default function AssistantScreen() {
                       )}
                     </TouchableOpacity>
 
-                    {/* View button — only when file exists */}
                     {doc.file_url ? (
                       <TouchableOpacity
                         className="flex-1 flex-row items-center justify-center gap-1.5 h-9 rounded-xl bg-[#7C3AED]"
@@ -711,8 +716,8 @@ export default function AssistantScreen() {
               ))}
             </View>
           )}
-        </ScrollView>
-      )}
+        </ScrollView> */}
+      {/* )} */}
 
       {/* ── SAFETY ── */}
       {activeTab === "safety" && (
@@ -834,9 +839,7 @@ export default function AssistantScreen() {
                 {amount
                   ? (parseFloat(amount) * (RATES[fromCur] ?? 1)).toLocaleString(
                       "en-IN",
-                      {
-                        maximumFractionDigits: 2,
-                      },
+                      { maximumFractionDigits: 2 },
                     )
                   : "0"}
               </Text>

@@ -60,7 +60,7 @@ export default function RootLayout() {
       <View
         style={{
           flex: 1,
-          backgroundColor: "#0A0F1E",
+          backgroundColor: "#fff",
           alignItems: "center",
           justifyContent: "center",
         }}
