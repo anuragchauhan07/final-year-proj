@@ -17,9 +17,9 @@ import { Ionicons } from "@expo/vector-icons";
 import * as DocumentPicker from "expo-document-picker";
 
 // ─────────────────────────────────────────────────────────────
-// 🔑  PASTE YOUR GEMINI API KEY HERE
+// 🔑  PASTE YOUR GROQ API KEY HERE
 // ─────────────────────────────────────────────────────────────
-const GEMINI_API_KEY = "AIzaSyBfl52Rxms87IVAwmgIVbCFwDaePd32WnM";
+const GROQ_API_KEY = process.env.EXPO_PUBLIC_GROQ_API_KEY ?? "";
 // ─────────────────────────────────────────────────────────────
 
 type AssistantTab =
@@ -82,41 +82,39 @@ const CHAT_PROMPTS = [
   "Visa requirements for Thailand?",
 ];
 
-// ── Gemini helper ─────────────────────────────────────────────
-// Uses gemini-2.0-flash via the generateContent REST endpoint.
-// `system` becomes the first "user" turn prefixed with role context,
-// and previous messages are mapped to Gemini's "user"/"model" roles.
-async function callGemini(
+// ── Groq helper ───────────────────────────────────────────────
+// Uses llama-3.3-70b-versatile via Groq's OpenAI-compatible REST endpoint.
+async function callGroq(
   system: string,
   messages: { role: "user" | "assistant"; content: string }[],
   maxTokens = 1000,
 ): Promise<string> {
-  // Gemini uses "user" / "model" roles (not "assistant")
-  const geminiMessages = messages.map((m) => ({
-    role: m.role === "assistant" ? "model" : "user",
-    parts: [{ text: m.content }],
-  }));
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+  const url = "https://api.groq.com/openai/v1/chat/completions";
 
   const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${GROQ_API_KEY}`,
+    },
     body: JSON.stringify({
-      system_instruction: { parts: [{ text: system }] },
-      contents: geminiMessages,
-      generationConfig: { maxOutputTokens: maxTokens },
+      model: "llama-3.3-70b-versatile",
+      max_tokens: maxTokens,
+      messages: [
+        { role: "system", content: system },
+        ...messages,
+      ],
     }),
   });
 
   if (!res.ok) {
     const err = await res.text();
-    throw new Error(`Gemini API error ${res.status}: ${err}`);
+    throw new Error(`Groq API error ${res.status}: ${err}`);
   }
 
   const data = await res.json();
-  // Response path: candidates[0].content.parts[0].text
-  return data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+  // Response path: choices[0].message.content
+  return data.choices?.[0]?.message?.content ?? "";
 }
 
 export default function AssistantScreen() {
@@ -168,7 +166,7 @@ export default function AssistantScreen() {
     setMessages(updated);
     setChatLoading(true);
     try {
-      const reply = await callGemini(
+      const reply = await callGroq(
         "You are a helpful AI travel assistant. Give concise, practical advice (under 120 words). Focus on Indian travel context when relevant. Be friendly and specific.",
         updated.map((m) => ({
           role: m.role === "ai" ? "assistant" : "user",
@@ -198,7 +196,7 @@ export default function AssistantScreen() {
     setPackLoading(true);
     setPackList([]);
     try {
-      const text = await callGemini(
+      const text = await callGroq(
         'Return ONLY a JSON array of strings. No markdown, no preamble. Example: ["Item 1","Item 2"]',
         [
           {
@@ -208,8 +206,9 @@ export default function AssistantScreen() {
         ],
       );
       setPackList(JSON.parse(text.replace(/```json|```/g, "").trim()));
-    } catch {
+    } catch (e) {
       Alert.alert("Error", "Could not generate list.");
+      console.log(e);
     } finally {
       setPackLoading(false);
     }
@@ -253,11 +252,6 @@ export default function AssistantScreen() {
     setDocs((prev) => prev.filter((d) => d.id !== id));
   };
 
-  // ── FIX: upload blob directly — do NOT use `new File([blob], name)`
-  // React Native's Blob has `name` as a read-only getter, so the File
-  // constructor throws "Cannot assign to property 'name' which has only
-  // a getter". Pass the blob straight to Supabase and set contentType
-  // via the upload options instead.
   const pickAndUploadFile = async (docId: string) => {
     try {
       const result = await DocumentPicker.getDocumentAsync({
@@ -279,18 +273,14 @@ export default function AssistantScreen() {
         return;
       }
 
-      // Fetch the local URI and convert to a Blob
       const response = await fetch(asset.uri);
       const blob = await response.blob();
 
       const ext = asset.name.split(".").pop() ?? "bin";
       const mimeType = asset.mimeType ?? blob.type ?? "application/octet-stream";
 
-      // Storage path: userId/docId.ext
       const storagePath = `${user.id}/${docId}.${ext}`;
 
-      // ✅ Upload the blob directly — no `new File()` wrapper needed.
-      // Supabase Storage accepts a Blob just fine; pass contentType in options.
       const { error: uploadError } = await supabase.storage
         .from("travel-documents")
         .upload(storagePath, blob, {
@@ -304,7 +294,6 @@ export default function AssistantScreen() {
         return;
       }
 
-      // Get a signed URL valid for 1 year
       const { data: signedData, error: signErr } = await supabase.storage
         .from("travel-documents")
         .createSignedUrl(storagePath, 60 * 60 * 24 * 365);
@@ -315,7 +304,6 @@ export default function AssistantScreen() {
         return;
       }
 
-      // Persist URL back to the documents row
       await supabase
         .from("documents")
         .update({ file_url: signedData.signedUrl })
@@ -335,14 +323,6 @@ export default function AssistantScreen() {
     }
   };
 
-  const openFile = (url: string) => {
-    Linking.openURL(url).catch(() => Alert.alert("Cannot open file"));
-  };
-
-  // useEffect(() => {
-  //   if (activeTab === "vault") fetchDocs();
-  // }, [activeTab]);
-
   // ── Weather ───────────────────────────────────────────────────
   const getWeather = async () => {
     if (!weatherCity.trim()) {
@@ -352,7 +332,7 @@ export default function AssistantScreen() {
     setWeatherLoading(true);
     setWeatherInfo("");
     try {
-      const text = await callGemini(
+      const text = await callGroq(
         "You are a travel weather advisor. Give a brief (60 words max) weather summary for the city including typical temperature, what to expect, and what to wear. Be practical.",
         [
           {
@@ -579,145 +559,6 @@ export default function AssistantScreen() {
           )}
         </ScrollView>
       )}
-
-      {/* {activeTab === "vault" && ( */}
-        {/* <ScrollView
-          className="flex-1 px-5 pt-5"
-          showsVerticalScrollIndicator={false}
-        >
-          <View className="bg-white border border-[#F3F0FF] rounded-3xl p-4 gap-3 mb-4">
-            <Text className="text-[#111827] text-sm font-bold">
-              Add Document
-            </Text>
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              className="-mx-1"
-            >
-              {DOC_TYPES.map((type) => (
-                <TouchableOpacity
-                  key={type}
-                  onPress={() => setNewDocType(type)}
-                  className={`mx-1 px-4 py-2 rounded-xl ${
-                    newDocType === type ? "bg-[#7C3AED]" : "bg-[#F5F3FF]"
-                  }`}
-                >
-                  <Text
-                    className={`text-xs font-semibold capitalize ${
-                      newDocType === type ? "text-white" : "text-[#7C3AED]"
-                    }`}
-                  >
-                    {type}
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </ScrollView>
-            <View className="flex-row items-center bg-[#F9F5FF] border border-[#E9D5FF] rounded-2xl px-4 h-12">
-              <TextInput
-                className="flex-1 text-[#111827] text-sm"
-                placeholder="Notes (e.g. Expires Dec 2027)"
-                placeholderTextColor="#C4B5FD"
-                value={newDocNote}
-                onChangeText={setNewDocNote}
-              />
-            </View>
-            <TouchableOpacity
-              className="h-12 bg-[#7C3AED] rounded-2xl items-center justify-center"
-              onPress={addDoc}
-            >
-              <Text className="text-white text-sm font-bold">
-                Save Document
-              </Text>
-            </TouchableOpacity>
-          </View>
-
-          {vaultLoading ? (
-            <ActivityIndicator color="#7C3AED" />
-          ) : (
-            <View className="gap-3 mb-8">
-              {docs.length === 0 && (
-                <Text className="text-[#9CA3AF] text-sm text-center py-6">
-                  No documents saved yet.
-                </Text>
-              )}
-              {docs.map((doc) => (
-                <View
-                  key={doc.id}
-                  className="bg-white border border-[#F3F0FF] rounded-2xl px-4 py-3 gap-2"
-                >
-                  <View className="flex-row items-center gap-3">
-                    <View className="w-10 h-10 rounded-xl bg-[#EDE9FE] items-center justify-center">
-                      <Ionicons
-                        name="document-text-outline"
-                        size={18}
-                        color="#7C3AED"
-                      />
-                    </View>
-                    <View className="flex-1">
-                      <Text className="text-[#111827] text-sm font-semibold capitalize">
-                        {doc.type}
-                      </Text>
-                      {doc.notes ? (
-                        <Text className="text-[#6B7280] text-xs mt-0.5">
-                          {doc.notes}
-                        </Text>
-                      ) : null}
-                    </View>
-                    <TouchableOpacity onPress={() => deleteDoc(doc.id)}>
-                      <Ionicons
-                        name="trash-outline"
-                        size={16}
-                        color="#E11D48"
-                      />
-                    </TouchableOpacity>
-                  </View>
-
-                  <View className="flex-row gap-2 mt-1">
-                    <TouchableOpacity
-                      className="flex-1 flex-row items-center justify-center gap-1.5 h-9 rounded-xl border border-[#DDD6FE] bg-[#F5F3FF]"
-                      onPress={() => pickAndUploadFile(doc.id)}
-                      disabled={uploadingId === doc.id}
-                    >
-                      {uploadingId === doc.id ? (
-                        <ActivityIndicator size="small" color="#7C3AED" />
-                      ) : (
-                        <>
-                          <Ionicons
-                            name="cloud-upload-outline"
-                            size={14}
-                            color="#7C3AED"
-                          />
-                          <Text className="text-[#7C3AED] text-xs font-semibold">
-                            {doc.file_url ? "Replace File" : "Upload File"}
-                          </Text>
-                        </>
-                      )}
-                    </TouchableOpacity>
-
-                    {doc.file_url ? (
-                      <TouchableOpacity
-                        className="flex-1 flex-row items-center justify-center gap-1.5 h-9 rounded-xl bg-[#7C3AED]"
-                        onPress={() => openFile(doc.file_url!)}
-                      >
-                        <Ionicons name="eye-outline" size={14} color="#fff" />
-                        <Text className="text-white text-xs font-semibold">
-                          View File
-                        </Text>
-                      </TouchableOpacity>
-                    ) : (
-                      <View className="flex-1 h-9 rounded-xl bg-[#F3F0FF] items-center justify-center">
-                        <Text className="text-[#C4B5FD] text-xs">
-                          No file yet
-                        </Text>
-                      </View>
-                    )}
-                  </View>
-                </View>
-              ))}
-            </View>
-          )}
-        </ScrollView> */}
-      {/* )} */}
 
       {/* ── SAFETY ── */}
       {activeTab === "safety" && (
